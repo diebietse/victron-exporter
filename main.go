@@ -2,15 +2,15 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
-
-var systemSerialID = ""
 
 var (
 	listenAddress = flag.String("web.listen-address",
@@ -66,38 +66,20 @@ func main() {
 	}()
 
 	mqttOpts := mqttConnectionConfig{*host, *port, *secure, *username, *password}
-	go func() {
-		err := listen(*clientPrefix+"_sub", mqttOpts, "#")
-		if err != nil {
-			log.WithError(err).Fatal("failed to establish mqtt subscription connection")
-		}
-	}()
 
-	client, err := connect(*clientPrefix+"_pub", mqttOpts)
+	client, err := NewVictronClient(*clientPrefix, mqttOpts)
 	if err != nil {
 		log.WithError(err).Fatal("failed to establish mqtt publish connection")
 	}
 
-	timer := time.NewTicker(*pollInterval)
-	for range timer.C {
-		if !client.IsConnectionOpen() {
-			log.Debug("mqtt connection not yet established")
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 
-			continue
-		}
+	go func() {
+		time.Sleep(10 * time.Second)
+		log.Fatal("graceful shutdown timed out")
+	}()
 
-		// Check whether we've heard back from victron mqtt yet...
-		if systemSerialID == "" {
-			log.Debug("awaiting system serial ID response from Victron mqtt bus")
-
-			continue
-		}
-
-		token := client.Publish(fmt.Sprintf("R/%s/system/0/Serial", systemSerialID), 1, false, "")
-		for !token.WaitTimeout(5 * time.Second) {
-			if err := token.Error(); err != nil {
-				log.WithError(err).Error("mqtt publish failed")
-			}
-		}
-	}
+	client.Close()
 }
