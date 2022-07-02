@@ -3,16 +3,15 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
-	"strings"
 	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
+	"github.com/suprememoocow/victron-exporter/pkg/parser"
 )
 
 const serialTopic = "N/+/system/0/Serial"
@@ -34,30 +33,9 @@ func tokenToErrContext(ctx context.Context, t mqtt.Token) error {
 }
 
 func newTLSConfig() *tls.Config {
-	// First, create the set of root certificates. For this example we only
-	// have one. It's also possible to omit this in order to use the
-	// default root set of the current operating system.
-	roots := x509.NewCertPool()
-	ok := roots.AppendCertsFromPEM([]byte(rootPEM))
-	if !ok {
-		panic("failed to parse root certificate")
-	}
-
-	// Create tls.Config with desired tls properties
 	return &tls.Config{
-		// RootCAs = certs used to verify server cert.
-		RootCAs: roots,
-		// ClientAuth = whether to request cert from server.
-		// Since the server is set up for SSL, this happens
-		// anyways.
-		ClientAuth: tls.NoClientCert,
-		// ClientCAs = certs used to validate client cert.
-		ClientCAs: nil,
-		// InsecureSkipVerify = verify that cert contents
-		// match server. IP matches what is in cert etc.
+		// The certificate is self signed, so no point in trying to verify against a know CA.
 		InsecureSkipVerify: true, //nolint:gosec
-		// // Certificates = list of certs client sends to server.
-		// Certificates: []tls.Certificate{cert},
 	}
 }
 
@@ -191,62 +169,46 @@ type victronStringValue struct {
 func mqttSubscriptionHandler(client mqtt.Client, msg mqtt.Message) {
 	subscriptionsUpdatesTotal.Inc()
 
-	topic := msg.Topic()
-	topicParts := strings.Split(topic, "/")
-	if len(topicParts) < 5 {
+	c, err := parser.ParseComponent(msg.Topic(), msg.Payload())
+	if err != nil {
 		subscriptionsUpdatesIgnoredTotal.Inc()
-
+		if !errors.Is(err, parser.ErrTopicLengthTooShort) {
+			fields := logrus.Fields{
+				"topic":   msg.Topic(),
+				"payload": string(msg.Payload()),
+			}
+			logrus.WithError(err).WithFields(fields).Error("Could not parse topic")
+		}
 		return
 	}
-	topicInfoParts := topicParts[4:]
 
-	componentType := topicParts[2]
-	componentID := topicParts[3]
-
-	topicString := strings.Join(topicInfoParts, "/")
-
-	o, ok := suffixTopicMap[topicString]
+	o, ok := suffixTopicMap[c.ComponentPath]
 	if !ok {
 		subscriptionsUpdatesIgnoredTotal.Inc()
 		return
 	}
-
-	var v victronValue
-
-	err := json.Unmarshal(msg.Payload(), &v)
-	if err != nil {
-		log.Warn("failed to unmarshal victron mqtt payload: ", err)
-		subscriptionsUpdatesIgnoredTotal.Inc()
-
-		return
-	}
-
-	if v.Value == nil {
-		o(componentType, componentID, math.NaN())
-	} else {
-		o(componentType, componentID, *v.Value)
-	}
+	o(c.ComponentType, c.ComponentID, c.AsMetric())
 }
 
 func mqttSerialSubscriptionHandler(c chan string) mqtt.MessageHandler {
 	return func(client mqtt.Client, msg mqtt.Message) {
 		subscriptionsUpdatesTotal.Inc()
 
-		var v victronStringValue
-
-		err := json.Unmarshal(msg.Payload(), &v)
+		value, err := parser.ParsePayloadAsString(msg.Payload())
 		if err != nil {
-			log.Warn("failed to unmarshal victron serial mqtt payload: ", err)
+			fields := logrus.Fields{
+				"topic":   msg.Topic(),
+				"payload": string(msg.Payload()),
+			}
+			logrus.WithError(err).WithFields(fields).Error("Could not parse serial")
 			subscriptionsUpdatesIgnoredTotal.Inc()
 
 			return
 		}
 
-		if v.Value != "" {
-			c <- v.Value
+		if value != "" {
+			c <- value
 		}
-
-		return
 	}
 }
 
@@ -260,6 +222,8 @@ func (v *victronClient) serialReader() {
 		case systemSerialID = <-v.serial:
 			if !pollerRunning {
 				wg.Add(1)
+				logrus.WithField("serial", systemSerialID).Info("Device serial found, starting monitoring")
+
 				go v.keepAliver(&wg, systemSerialID)
 				pollerRunning = true
 				err := tokenToErr(v.client.Unsubscribe(serialTopic))
@@ -281,11 +245,12 @@ func (v *victronClient) keepAliver(wg *sync.WaitGroup, systemSerialID string) {
 	for {
 		select {
 		case <-t.C:
-			err := tokenToErrContext(v.ctx,
-				v.client.Publish(fmt.Sprintf(pollTopicTemplate, systemSerialID), 1, false, ""))
-			if err != nil {
-				log.WithError(err).Error("mqtt publish failed")
-			}
+			// err := tokenToErrContext(v.ctx,
+			// 	v.client.Publish(fmt.Sprintf(pollTopicTemplate, systemSerialID), 1, false, ""))
+			// if err != nil {
+			// 	log.WithError(err).Error("mqtt publish failed")
+			// }
+			logrus.Info("Fake keep alive")
 		case <-v.ctx.Done():
 			return
 		}
