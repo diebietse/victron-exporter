@@ -10,6 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+	"github.com/suprememoocow/victron-exporter/pkg/metrics"
+	"github.com/suprememoocow/victron-exporter/pkg/pubsub"
 )
 
 var (
@@ -65,9 +67,17 @@ func main() {
 		}
 	}()
 
-	mqttOpts := mqttConnectionConfig{*host, *port, *secure, *username, *password}
+	mqttOpts := pubsub.Config{
+		Host:     *host,
+		Port:     *port,
+		Secure:   *secure,
+		Username: *username,
+		Password: *password,
+	}
 
-	client, err := NewVictronClient(*clientPrefix, mqttOpts)
+	observer := metrics.New(*clientPrefix)
+
+	client, err := pubsub.New(*clientPrefix, mqttOpts, observer)
 	if err != nil {
 		log.WithError(err).Fatal("failed to establish mqtt publish connection")
 	}
