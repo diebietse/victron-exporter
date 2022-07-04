@@ -1,17 +1,36 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	log "github.com/sirupsen/logrus"
 )
+
+const serialTopic = "N/+/system/0/Serial"
+const statsTopic = "N/#"
+const pollTopicTemplate = "R/%s/system/0/Serial"
+
+func tokenToErr(t mqtt.Token) error {
+	return tokenToErrContext(context.Background(), t)
+}
+
+func tokenToErrContext(ctx context.Context, t mqtt.Token) error {
+	select {
+	case <-t.Done():
+		return t.Error()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func newTLSConfig() *tls.Config {
 	// First, create the set of root certificates. For this example we only
@@ -49,41 +68,64 @@ type mqttConnectionConfig struct {
 	password string
 }
 
-func connectWait(client mqtt.Client) error {
-	token := client.Connect()
-	for !token.WaitTimeout(3 * time.Second) {
-	}
+type victronClient struct {
+	pollInterval time.Duration
 
-	err := token.Error()
-	if err != nil {
-		return fmt.Errorf("failed to connect to mqtt: %w", err)
-	}
+	serial chan string
+	client mqtt.Client
 
-	return nil
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-func connect(clientID string, config mqttConnectionConfig) (mqtt.Client, error) {
-	client := mqtt.NewClient(createClientOptions(clientID, config, nil))
-
-	return client, connectWait(client)
-}
-
-func listen(clientID string, config mqttConnectionConfig, topic string) error {
+func newVictronClient(clientID string, pollInterval time.Duration, config mqttConnectionConfig) (*victronClient, error) {
 	log.WithFields(log.Fields{
 		"host": config.host,
 		"port": config.port,
 	}).Debug("connecting to mqtt")
 
+	serialChan := make(chan string)
+
 	onConnect := func(client mqtt.Client) {
 		log.Info("mqtt connected, subscribing to topics...")
 		// We need to subscribe after each connection
 		// since mqtt does not maintain subscriptions across reconnects
-		client.Subscribe(topic, 0, mqttSubscriptionHandler)
+		err := tokenToErr(client.Subscribe(serialTopic, 0, mqttSerialSubscriptionHandler(serialChan)))
+		if err != nil {
+			log.WithError(err).Error("failed to subscribe")
+		}
+
+		err = tokenToErr(client.Subscribe(statsTopic, 0, mqttSubscriptionHandler))
+		if err != nil {
+			log.WithError(err).Error("failed to subscribe")
+		}
 	}
 
 	client := mqtt.NewClient(createClientOptions(clientID, config, onConnect))
+	err := tokenToErr(client.Connect())
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to mqtt: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	vc := &victronClient{
+		pollInterval: pollInterval,
+		serial:       serialChan,
+		client:       client,
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+	vc.wg.Add(1)
+	go vc.serialReader()
 
-	return connectWait(client)
+	return vc, nil
+}
+
+func (v *victronClient) Close() error {
+	v.client.Disconnect(5000)
+	v.cancel()
+	v.wg.Wait()
+	return nil
 }
 
 func newConnectionLostHandler(clientID string) mqtt.ConnectionLostHandler {
@@ -143,7 +185,7 @@ type victronValue struct {
 }
 
 type victronStringValue struct {
-	Value *string `json:"value"`
+	Value string `json:"value"`
 }
 
 func mqttSubscriptionHandler(client mqtt.Client, msg mqtt.Message) {
@@ -163,28 +205,9 @@ func mqttSubscriptionHandler(client mqtt.Client, msg mqtt.Message) {
 
 	topicString := strings.Join(topicInfoParts, "/")
 
-	if (topicString == "Serial") && (systemSerialID == "") {
-		var v victronStringValue
-
-		err := json.Unmarshal(msg.Payload(), &v)
-		if err != nil {
-			log.Warn("failed to unmarshal victron mqtt payload: ", err)
-			subscriptionsUpdatesIgnoredTotal.Inc()
-
-			return
-		}
-
-		if v.Value != nil {
-			systemSerialID = *v.Value
-		}
-
-		return
-	}
-
 	o, ok := suffixTopicMap[topicString]
 	if !ok {
 		subscriptionsUpdatesIgnoredTotal.Inc()
-
 		return
 	}
 
@@ -202,5 +225,65 @@ func mqttSubscriptionHandler(client mqtt.Client, msg mqtt.Message) {
 		o(componentType, componentID, math.NaN())
 	} else {
 		o(componentType, componentID, *v.Value)
+	}
+}
+
+func mqttSerialSubscriptionHandler(c chan string) mqtt.MessageHandler {
+	return func(client mqtt.Client, msg mqtt.Message) {
+		subscriptionsUpdatesTotal.Inc()
+
+		var v victronStringValue
+
+		err := json.Unmarshal(msg.Payload(), &v)
+		if err != nil {
+			log.Warn("failed to unmarshal victron serial mqtt payload: ", err)
+			subscriptionsUpdatesIgnoredTotal.Inc()
+
+			return
+		}
+
+		if v.Value != "" {
+			c <- v.Value
+		}
+
+		return
+	}
+}
+
+func (v *victronClient) serialReader() {
+	defer v.wg.Done()
+	wg := sync.WaitGroup{}
+	pollerRunning := false
+	for {
+		var systemSerialID string
+		select {
+		case systemSerialID = <-v.serial:
+			if !pollerRunning {
+				wg.Add(1)
+				go v.keepAliver(&wg, systemSerialID)
+				pollerRunning = true
+			}
+		case <-v.ctx.Done():
+			wg.Wait()
+			return
+		}
+	}
+}
+
+func (v *victronClient) keepAliver(wg *sync.WaitGroup, systemSerialID string) {
+	defer wg.Done()
+	t := time.NewTicker(v.pollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			err := tokenToErrContext(v.ctx,
+				v.client.Publish(fmt.Sprintf(pollTopicTemplate, systemSerialID), 1, false, ""))
+			if err != nil {
+				log.WithError(err).Error("mqtt publish failed")
+			}
+		case <-v.ctx.Done():
+			return
+		}
 	}
 }

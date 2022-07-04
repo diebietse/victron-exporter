@@ -2,15 +2,15 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
-
-var systemSerialID = ""
 
 var (
 	listenAddress = flag.String("web.listen-address",
@@ -65,39 +65,27 @@ func main() {
 		}
 	}()
 
-	mqttOpts := mqttConnectionConfig{*host, *port, *secure, *username, *password}
+	mqttOpts := mqttConnectionConfig{
+		host:     *host,
+		port:     *port,
+		secure:   *secure,
+		username: *username,
+		password: *password,
+	}
+
+	client, err := newVictronClient(*clientPrefix, *pollInterval, mqttOpts)
+	if err != nil {
+		log.WithError(err).Fatal("failed to establish mqtt connection")
+	}
+
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+
 	go func() {
-		err := listen(*clientPrefix+"_sub", mqttOpts, "#")
-		if err != nil {
-			log.WithError(err).Fatal("failed to establish mqtt subscription connection")
-		}
+		time.Sleep(10 * time.Second)
+		log.Fatal("graceful shutdown timed out")
 	}()
 
-	client, err := connect(*clientPrefix+"_pub", mqttOpts)
-	if err != nil {
-		log.WithError(err).Fatal("failed to establish mqtt publish connection")
-	}
-
-	timer := time.NewTicker(*pollInterval)
-	for range timer.C {
-		if !client.IsConnectionOpen() {
-			log.Debug("mqtt connection not yet established")
-
-			continue
-		}
-
-		// Check whether we've heard back from victron mqtt yet...
-		if systemSerialID == "" {
-			log.Debug("awaiting system serial ID response from Victron mqtt bus")
-
-			continue
-		}
-
-		token := client.Publish(fmt.Sprintf("R/%s/system/0/Serial", systemSerialID), 1, false, "")
-		for !token.WaitTimeout(5 * time.Second) {
-			if err := token.Error(); err != nil {
-				log.WithError(err).Error("mqtt publish failed")
-			}
-		}
-	}
+	client.Close()
 }
